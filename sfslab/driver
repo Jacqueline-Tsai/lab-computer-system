@@ -1,0 +1,305 @@
+#! /usr/bin/python3
+
+"""Test driver for SFS lab.  This program tests your code against the full
+set of SFS traces, exactly as Autolab will."""
+
+# Compatibility note: This program needs to run on the sharks and on the
+# "ubun2022" autograder VMs, where Python is v3.10.
+
+import argparse
+import subprocess
+import sys
+import os
+
+from pathlib import Path
+from typing import NoReturn
+
+
+def run_test_program(args: list[Path | str], envT: list[str | str]) -> (int | str):
+    proc = subprocess.Popen(
+        args,
+        env = envT,
+        stdin = subprocess.DEVNULL,
+        stdout = subprocess.PIPE,
+        stderr = subprocess.STDOUT,
+    )
+    output = proc.stdout.read().decode("utf-8", errors="backslashreplace")
+    rc = proc.wait()
+    if rc > 0:
+        output += f"\n*** {args[0]}: exit {rc}\n"
+    elif rc < 0:
+        import signal
+        output += f"\n*** {args[0]}: {signal.strsignal(-rc)}\n"
+    return (rc, output)
+
+
+def ensure_test_programs(args: argparse.Namespace) -> None:
+    args.fsck = args.fsck.expanduser().resolve()
+    args.tester = args.tester.expanduser().resolve()
+    if not args.fsck.exists():
+        raise RuntimeError(
+            f"{args.fsck} does not exist. Did you forget to run 'make'?"
+        )
+    if not args.tester.exists():
+        raise RuntimeError(
+            f"{args.tester} does not exist. Did you forget to run 'make'?"
+        )
+
+
+def find_trace_groups(tracedir: Path) -> dict[str, list[Path]]:
+    groups: dict[str, list[Path]] = {}
+    for trace in tracedir.glob("[A-Z][0-9][0-9]-*.lua"):
+        group = trace.name[0]
+        if group not in groups:
+            groups[group] = []
+        groups[group].append(trace)
+        groups[group].sort()
+
+    return groups
+
+
+def delete_old_disks(disksdir: Path) -> None:
+    for od in list(disksdir.glob("*.sfs")):
+        od.unlink()
+
+
+def run_one_trace(trace: Path, disksdir: Path, tester: Path, fsck: Path) -> int:
+    disks_before = frozenset(disksdir.glob("*.sfs"))
+
+    sys.stdout.write(f"{trace.name}... ")
+    sys.stdout.flush()
+    (rc, trace_result) = run_test_program([tester, trace], os.environ)
+    if rc != 0:
+        sys.stdout.write(f"FAIL\n{tester.name} output for {trace.name}:\n")
+        sys.stdout.write(trace_result)
+        sys.stdout.write("-"*70 + "\n\n")
+        return 0
+
+    disks_after = frozenset(disksdir.glob("*.sfs"))
+
+    for disk in sorted(disks_after - disks_before):
+        (rc, fsck_result) = run_test_program([fsck, disk], os.environ)
+        if rc != 0:
+            sys.stdout.write(f"FAIL\n{fsck.name} output for {disk.name}:\n")
+            sys.stdout.write(fsck_result)
+            sys.stdout.write("-"*70 + "\n\n")
+            return 0
+
+    sys.stdout.write("ok\n")
+    return 1
+
+def perf_cleanup(taskgraph: Path) -> None:
+    taskgraph.unlink()
+    p = Path("disk.trace")
+    p.unlink()
+
+def run_one_trace_perf(trace: Path, disksdir: Path, tester: Path, fsck: Path, cleanup: bool) -> int:
+    disks_before = frozenset(disksdir.glob("*.sfs"))
+
+    prefix = trace.name.split('-')[0]
+
+    sys.stdout.write(f"{trace.name}... ")
+    sys.stdout.flush()
+    env = os.environ
+    env['CONTECH_FE_FILE'] = "disk.trace"
+    (rc, trace_result) = run_test_program([tester, trace], env)
+    if rc != 0:
+        sys.stdout.write(f"FAIL\n{tester.name} output for {trace.name}:\n")
+        sys.stdout.write(trace_result)
+        sys.stdout.write("-"*70 + "\n\n")
+        
+        return -1
+
+    taskgraph_name = prefix + ".taskgraph"
+
+    (rc, trace_result) = run_test_program(["./trace2taskgraph", "disk.trace", taskgraph_name], env)
+    if rc != 0:
+        sys.stdout.write(f"FAIL\n{tester.name} output for {trace.name}:\n")
+        sys.stdout.write(trace_result)
+        sys.stdout.write("-"*70 + "\n\n")
+        
+        if cleanup:
+            perf_cleanup(Path(taskgraph_name))
+        
+        return -1
+
+    (rc, trace_result) = run_test_program(["./raceTool", taskgraph_name], env)
+    if rc != 0:
+        sys.stdout.write(f"FAIL\n{tester.name} output for {trace.name}:\n")
+        sys.stdout.write(trace_result)
+        sys.stdout.write("-"*70 + "\n\n")
+        
+        if cleanup:
+            perf_cleanup(Path(taskgraph_name))
+        
+        return -1
+
+    # TODO: Convert output of sfsperf into a ratio: 1- s/w
+    (rc, trace_result) = run_test_program(["./sfsperf", taskgraph_name], env)
+    score = 0.0
+    if rc != 0:
+        sys.stdout.write(f"FAIL\n{tester.name} output for {trace.name}:\n")
+        sys.stdout.write(trace_result)
+        sys.stdout.write("-"*70 + "\n\n")
+        
+        if cleanup:
+            perf_cleanup(Path(taskgraph_name))
+        
+        return -1
+    else:
+        (work, span) = trace_result.split('\n')[1].split(',')
+        score = 1 - (float(span) / float(work))
+
+    sys.stdout.write("ok\n")
+    return score
+
+def run_traces_perf(scores: dict[str, int],
+               trace_groups: dict[str, list[Path]],
+               args: argparse.Namespace) -> None:
+    test_fail = False
+    for group in sorted(trace_groups.keys()):
+        for trace in trace_groups[group]:
+            disk = args.disksdir / (trace.stem + ".sfs")
+            cleanup = False
+            if args.autograder:
+                cleanup = True
+            local_score = run_one_trace_perf(trace, disk, args.tester, args.fsck, cleanup)
+            if local_score == -1:
+                test_fail = True
+            scores[group] += local_score
+    if test_fail == True:
+        scores[group] = 0.0
+
+def run_traces(scores: dict[str, int],
+               trace_groups: dict[str, list[Path]],
+               args: argparse.Namespace) -> None:
+    for group in sorted(trace_groups.keys()):
+        for trace in trace_groups[group]:
+            disk = args.disksdir / (trace.stem + ".sfs")
+            scores[group] += run_one_trace(trace, disk, args.tester, args.fsck)
+
+
+def main() -> NoReturn:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("-t", "--tester", type=Path,
+                    help="Use this program as the trace tester"
+                    " (default: ./sfs-tester)",
+                    default="sfs-tester")
+    ap.add_argument("-f", "--fsck", type=Path,
+                    help="Use this program as the filesystem checker"
+                    " (default: ./sfs-fsck)",
+                    default="sfs-fsck")
+    ap.add_argument("-T", "--tracedir", type=Path,
+                    help="Find traces in this directory (default: ./traces)",
+                    default="traces")
+    ap.add_argument("-D", "--disksdir", type=Path,
+                    help="Expect traces to create disk images in this directory"
+                    " (default: ./disks)",
+                    default="disks")
+    ap.add_argument("-P","--perf", action="store_true",
+                    help="Run performance tests.  Default is run after A/B/C all pass")
+    ap.add_argument("-A", "--autograder", action="store_true",
+                    help="Print a JSON score report as expected by Autolab")
+    args = ap.parse_args()
+
+    scores: dict[str, int] = {}
+    perf_scores: dict[str, int] = {}
+    ok = False
+
+    total_points = 0
+    if (args.perf == False):
+        try:
+            ensure_test_programs(args)
+            trace_groups = find_trace_groups(args.tracedir)
+            for group in sorted(trace_groups.keys()):
+                scores[group] = 0
+
+            delete_old_disks(args.disksdir)
+            run_traces(scores, trace_groups, args)
+
+            sys.stdout.write("\n" + "-"*70 + "\nSummary:\n\n")
+            total_points_possible = 0
+            #scores.sort()
+            for group, points in scores.items():
+                points_possible = len(trace_groups[group])
+                total_points += points
+                total_points_possible += points_possible
+                sys.stdout.write(f"{group} traces: {points}/{points_possible}\n")
+                
+            sys.stdout.write(
+                f"\nTotal: {total_points}/{total_points_possible} points\n"
+            )
+            ok = (total_points == total_points_possible)
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
+    scores["P"] = 0
+    if (ok or args.perf):
+        # Run performance tests using sfs-tester-ct
+        # export CONTECH_FE_FILE <some name>
+        # ./sfs-tester-ct <c01>
+        # ./trace2taskgraph <some name> <c01.taskgraph>
+        # ./raceTool <c01.taskgraph>
+        try:
+            trace_groups = find_trace_groups(args.tracedir)
+            t = trace_groups["C"]
+            trace_groups = {}
+            trace_groups["C"] = t
+
+            perf_scores["C"] = 0
+            delete_old_disks(args.disksdir)
+
+            #args.tester = args.tester + "-ct"
+            args.tester = Path(args.tester.as_posix() + "-ct")
+            ensure_test_programs(args)
+            
+            total_points_perf = 0
+            total_points_possible = 0
+            
+            for i in range(5):
+                perf_scores["C"] = 0
+                total_points_tmp = 0
+                total_points_possible_tmp = 0
+                run_traces_perf(perf_scores, trace_groups, args)
+
+                for group, points in perf_scores.items():
+                    points_possible = len(trace_groups[group])
+                    total_points_tmp += points
+                    total_points_possible_tmp += points_possible
+                
+                if total_points_tmp > total_points_perf:
+                    total_points_perf = total_points_tmp
+            
+            total_points_perf *= 100
+            total_points_possible = 10
+            if total_points_perf > total_points_possible:
+                total_points_perf = total_points_possible
+            sys.stdout.write(
+                f"\nTotal: {total_points_perf}/{total_points_possible} points\n"
+            )
+            scores["P"] = total_points_perf
+            total_points += total_points_perf
+
+        except Exception:
+            import traceback
+            traceback.print_exc()
+    else:
+        sys.stdout.write("C traces not tested for performance\n")
+
+    if args.autograder:
+        # When being run by the autograder, we must always make sure to
+        # print a JSON score report and exit successfully, no matter how
+        # wrong things went, or Autolab core may malfunction.
+        sys.stdout.write("\n")
+        import json
+        total_points_str = []
+        for s in scores:
+            total_points_str.append(scores[s])
+        json.dump({"scores":scores,"scoreboard":total_points_str}, sys.stdout)
+        sys.exit(0)
+    else:
+        sys.exit(0 if ok else 1)
+
+main()

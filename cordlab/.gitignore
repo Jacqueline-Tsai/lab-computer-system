@@ -1,0 +1,18 @@
+# Temporary files
+*~
+._*
+core
+*.dSYM
+
+# Generated files
+test-cord
+grade-iscord
+grade-basic
+grade-rec
+grade-sub
+cordlab-handin.tar
+cord.o
+test-cord.o
+# The source code for the other .o files is not included
+# in the handout, so, if a student wants to use git for
+# this assignment, it would be appropriate to check them in.
